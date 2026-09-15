@@ -1,0 +1,32 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "usb/usb_descriptors.c"
+        "usb/hid_report.c"
+        "usb/usb_hid_device.c"
+        "usb/usb_switch2_vendor.c"
+        "ble/ble_central.c"
+        "ble/switch2_gatt.c"
+        "bridge/switch2_state.c"
+        "bridge/internal_gamepad_state.c"
+        "bridge/gamepad_axis_math.c"
+        "bridge/report_mapper.c"
+        "bridge/report_rate_stats.c"
+        "control/control_protocol.c"
+        "log/app_log.c"
+        "config/device_config.c"
+    INCLUDE_DIRS
+        "."
+        "usb"
+        "ble"
+        "bridge"
+        "control"
+        "log"
+        "config"
+    REQUIRES
+        esp_tinyusb
+        bt
+        nvs_flash
+        esp_timer
+        driver
+)
