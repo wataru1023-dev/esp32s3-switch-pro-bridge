@@ -5,6 +5,7 @@ Turn a Nintendo Switch 2 Pro controller into a wired **Nintendo Switch Pro Contr
 [English](README.md) · [中文](README.zh-CN.md) · [日本語](README.ja.md)
 
 This ESP-IDF firmware runs on an ESP32-S3. It connects to a real Switch 2 Pro controller ("Pro2") over Bluetooth Low Energy and exposes it to a Mac as a native Nintendo Switch Pro Controller (USB VID `057E`, PID `2009`). macOS recognizes it through the built-in Game Controller framework — no extra drivers required.
+Due to near-flawless emulation of the Pro Controller, preliminary tests show it is also functional on Windows.
 
 ## Features
 
