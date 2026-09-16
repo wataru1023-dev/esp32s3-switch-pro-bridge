@@ -39,11 +39,11 @@ static const char *TAG = "ble";
 #define BLE_SAFE_CONN_ITVL_MIN 12
 #define BLE_SAFE_CONN_ITVL_MAX 12
 #define BLE_SAFE_CONN_LATENCY 0
-#define BLE_SAFE_CONN_SUPERVISION_TIMEOUT 400
-#define BLE_FAST_CONN_ITVL_MIN 6
-#define BLE_FAST_CONN_ITVL_MAX 6
+#define BLE_SAFE_CONN_SUPERVISION_TIMEOUT 1000
+#define BLE_FAST_CONN_ITVL_MIN 12
+#define BLE_FAST_CONN_ITVL_MAX 12
 #define BLE_FAST_CONN_LATENCY 0
-#define BLE_FAST_CONN_SUPERVISION_TIMEOUT 400
+#define BLE_FAST_CONN_SUPERVISION_TIMEOUT 1000
 #define BLE_FAST_SCAN_ITVL 16
 #define BLE_FAST_SCAN_WINDOW 16
 #define BLE_FAST_PARAM_DROP_WINDOW_US 10000000LL
@@ -173,8 +173,6 @@ static TaskHandle_t s_auto_reconnect_task;
 static TaskHandle_t s_auto_connect_selected_task;
 static TaskHandle_t s_read_poll_task;
 static bool s_suppress_next_auto_reconnect;
-static bool s_fast_live_request_sent;
-static uint32_t s_live_parsed_since_connect;
 
 static const struct ble_gap_conn_params s_safe_connect_params = {
     .scan_itvl = BLE_FAST_SCAN_ITVL,
@@ -2134,16 +2132,6 @@ static void handle_notify_rx(const struct ble_gap_event *event)
                            now_us);
         uint32_t updates = 0;
         (void)switch2_state_get_live(NULL, &updates, NULL);
-        s_live_parsed_since_connect++;
-        if (!s_fast_live_request_sent &&
-            s_live_parsed_since_connect >= BLE_FAST_LIVE_WARMUP_PARSED_COUNT) {
-            s_fast_live_request_sent = true;
-            APP_LOGI(TAG,
-                     "BLE live input warmup complete parsed_since_connect=%lu total_parsed=%lu; requesting fast params once",
-                     (unsigned long)s_live_parsed_since_connect,
-                     (unsigned long)s_conn_metrics.notify_parsed_count);
-            (void)request_fast_conn_params_internal("live_warmup");
-        }
         if ((updates & 0x1ff) == 1) {
             APP_LOGI(TAG, "BLE notify parsed uuid=%s len=%u updates=%lu buttons=0x%08lx",
                      uuid,
@@ -2206,8 +2194,6 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             s_connected = true;
             s_conn_handle = event->connect.conn_handle;
             s_state = BLE_STATE_CONNECTED;
-            s_fast_live_request_sent = false;
-            s_live_parsed_since_connect = 0;
             s_conn_metrics.connect_success_count++;
             s_conn_metrics.last_connect_us = esp_timer_get_time();
             APP_LOGI(TAG, "BLE connected handle=%u", event->connect.conn_handle);
@@ -2274,8 +2260,6 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         s_connected = false;
         s_conn_handle = 0;
         s_state = BLE_STATE_IDLE;
-        s_fast_live_request_sent = false;
-        s_live_parsed_since_connect = 0;
         clear_gatt_cache();
         switch2_state_clear_live();
         clear_conn_metrics();
@@ -2303,8 +2287,6 @@ static void ble_on_reset(int reason)
     s_host_ready = false;
     s_connected = false;
     s_state = BLE_STATE_IDLE;
-    s_fast_live_request_sent = false;
-    s_live_parsed_since_connect = 0;
     s_auto_scan_connect = false;
     s_auto_scan_target_valid = false;
     s_auto_scan_preferred_valid = false;
@@ -2349,8 +2331,6 @@ void ble_central_init(void)
     s_connected = false;
     s_conn_handle = 0;
     s_scan_seen_count = 0;
-    s_fast_live_request_sent = false;
-    s_live_parsed_since_connect = 0;
     s_auto_scan_connect = false;
     s_auto_scan_target_valid = false;
     s_auto_scan_preferred_valid = false;
