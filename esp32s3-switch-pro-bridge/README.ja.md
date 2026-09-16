@@ -5,6 +5,7 @@ Nintendo Switch 2 Pro コントローラーを、macOS 上の有線 **Nintendo S
 [English](README.md) · [中文](README.zh-CN.md) · [日本語](README.ja.md)
 
 この ESP-IDF ファームウェアは ESP32-S3 上で動作します。実際の Switch 2 Pro コントローラー（Pro2）に Bluetooth Low Energy で接続し、それをネイティブの Nintendo Switch Pro コントローラー（USB VID `057E`、PID `2009`）として Mac に公開します。macOS は内蔵の Game Controller フレームワークで認識するため、ドライバーは不要です。
+Proコントローラーを極めて高精度にエミュレートしているため、予備テストの段階ではWindows環境でも使用可能です。
 
 ## 特徴
 
