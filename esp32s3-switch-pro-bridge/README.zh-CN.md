@@ -5,6 +5,7 @@
 [English](README.md) · [中文](README.zh-CN.md) · [日本語](README.ja.md)
 
 本固件运行在 ESP32-S3 上：通过蓝牙低功耗连接真实的 Switch 2 Pro 手柄（Pro2），再以原生 Nintendo Switch Pro Controller 的身份（USB VID `057E`、PID `2009`）呈现给 Mac。macOS 通过自带的 Game Controller 框架直接识别，无需额外驱动。
+由于较为完美的模拟了pro手柄，经初步测试在windows端也可用。
 
 ## 特性
 
