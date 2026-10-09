@@ -71,6 +71,7 @@ static uint8_t s_hd_left_vibration[5];
 static uint8_t s_hd_right_vibration[5];
 static uint8_t s_hd_packet_id;
 static uint8_t s_hd_stop_packets_pending;
+static uint32_t s_hd_stop_generation;
 static uint32_t s_hd_stream_updates;
 static uint32_t s_hd_stream_writes;
 static uint32_t s_hd_stream_stops;
@@ -687,6 +688,7 @@ void usb_switch2_vendor_stop_hd_rumble(void)
     s_hd_stream_until_us = 0;
     s_hd_stream_active = false;
     s_hd_stop_packets_pending = s_hd_stop_packet_count;
+    s_hd_stop_generation++;
     s_hd_stream_stops++;
     stops = s_hd_stream_stops;
     portEXIT_CRITICAL(&s_hd_lock);
@@ -809,6 +811,7 @@ static void hd_rumble_task(void *arg)
         uint8_t right[5];
         bool active;
         bool send_stop = false;
+        uint32_t stop_generation = 0;
         int64_t now_us = esp_timer_get_time();
         int64_t until_us;
 
@@ -820,11 +823,12 @@ static void hd_rumble_task(void *arg)
         if (s_hd_stream_active && !active) {
             s_hd_stream_active = false;
             s_hd_stop_packets_pending = s_hd_stop_packet_count;
+            s_hd_stop_generation++;
             s_hd_stream_stops++;
         }
         if (!active && s_hd_stop_packets_pending > 0) {
-            s_hd_stop_packets_pending--;
             send_stop = true;
+            stop_generation = s_hd_stop_generation;
             build_zero_ble_vibration(left);
             build_zero_ble_vibration(right);
         }
@@ -837,6 +841,13 @@ static void hd_rumble_task(void *arg)
             portENTER_CRITICAL(&s_hd_lock);
             if (err == ESP_OK) {
                 s_hd_stream_writes++;
+                /* A failed BLE write must not consume the only stop packets.
+                 * Nor may an old in-flight write consume a newer stop request. */
+                if (send_stop && !s_hd_stream_active &&
+                    stop_generation == s_hd_stop_generation &&
+                    s_hd_stop_packets_pending > 0) {
+                    s_hd_stop_packets_pending--;
+                }
             } else {
                 s_hd_stream_errors++;
             }
@@ -896,6 +907,11 @@ void usb_switch2_vendor_bridge_hid_output_to_ble(const uint8_t *data, uint16_t l
 
 static bool decode_switch_pro_rumble_motor(const uint8_t data[4], uint8_t out[5])
 {
+    static const uint8_t neutral[4] = {0x00, 0x01, 0x40, 0x40};
+    if (memcmp(data, neutral, sizeof(neutral)) == 0) {
+        build_zero_ble_vibration(out);
+        return false;
+    }
     int hf = data[0] | ((data[1] & 0x01) << 8);
     int hf_amp = (data[1] >> 1) & 0x7f;
     int lf = data[2] | ((data[3] & 0x01) << 8);
@@ -1058,20 +1074,29 @@ static size_t build_manager_control_reply(const uint8_t *cmd, uint16_t cmd_len,
 
     char command[192];
     size_t command_len = cmd_len - SWITCH2_CONTROL_MAGIC_LEN;
+    /* Manager commands use one USB packet. A full packet needs a terminator
+     * to distinguish a complete command from the prefix of a longer transfer. */
+    bool invalid_framing = cmd_len > 64 ||
+        (cmd_len == 64 && cmd[cmd_len - 1] != 0 &&
+         cmd[cmd_len - 1] != '\r' && cmd[cmd_len - 1] != '\n');
     while (command_len > 0 &&
            (cmd[SWITCH2_CONTROL_MAGIC_LEN + command_len - 1] == 0 ||
             cmd[SWITCH2_CONTROL_MAGIC_LEN + command_len - 1] == '\r' ||
             cmd[SWITCH2_CONTROL_MAGIC_LEN + command_len - 1] == '\n')) {
         command_len--;
     }
-    if (command_len >= sizeof(command)) {
-        command_len = sizeof(command) - 1;
-    }
-    memcpy(command, cmd + SWITCH2_CONTROL_MAGIC_LEN, command_len);
-    command[command_len] = 0;
+    invalid_framing = invalid_framing || command_len >= sizeof(command) ||
+                      memchr(cmd + SWITCH2_CONTROL_MAGIC_LEN, 0, command_len) != NULL;
 
     static char json[SWITCH2_CONTROL_REPLY_MAX - SWITCH2_CONTROL_REPLY_HEADER_LEN];
-    control_protocol_handle_line(command, json, sizeof(json));
+    if (invalid_framing) {
+        snprintf(json, sizeof(json),
+                 "{\"ok\":false,\"cmd\":\"command\",\"error\":\"invalid command framing (one packet, max 57 text bytes)\"}");
+    } else {
+        memcpy(command, cmd + SWITCH2_CONTROL_MAGIC_LEN, command_len);
+        command[command_len] = 0;
+        control_protocol_handle_line(command, json, sizeof(json));
+    }
 
     size_t json_len = strlen(json);
     size_t max_json_len = out_len - SWITCH2_CONTROL_REPLY_HEADER_LEN;
@@ -1144,6 +1169,11 @@ const char *usb_switch2_vendor_hid_guard_state(void)
 
 void usb_switch2_vendor_reset_hid_guard(void)
 {
+    /* Called on mount/unmount by the TinyUSB task. Never send the tail of a
+     * previous connection's bulk response to the next host session. */
+    s_pending_len = 0;
+    s_pending_offset = 0;
+    s_pending_itf = SWITCH2_VENDOR_ITF;
     s_hid_guard_active = false;
     s_hid_guard_done = false;
     s_hid_guard_release_after_tx = false;
@@ -1227,9 +1257,15 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
         return false;
     }
 
+    /* An OUT data stage would make TinyUSB memcpy into these const flash
+     * descriptors. Only the documented descriptor IN requests are supported. */
+    if (request->bmRequestType_bit.direction != TUSB_DIR_IN) {
+        return false;
+    }
     if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR &&
         request->bRequest == USB_SWITCH2_MS_VENDOR_CODE) {
-        if (request->wIndex == 0x0004) {
+        if (request->wIndex == 0x0004 && request->wValue == 0 &&
+            request->bmRequestType_bit.recipient == TUSB_REQ_RCPT_DEVICE) {
             APP_LOGI(TAG, "MS OS 1.0 compat ID requested len=%u",
                      (unsigned)sizeof(s_ms_os_10_compat_id_descriptor));
             return tud_control_xfer(rhport,
@@ -1238,7 +1274,9 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
                                     sizeof(s_ms_os_10_compat_id_descriptor));
         }
 
-        if (request->wIndex == 0x0005) {
+        if (request->wIndex == 0x0005 &&
+            request->wValue == USB_SWITCH2_VENDOR_INTERFACE &&
+            request->bmRequestType_bit.recipient == TUSB_REQ_RCPT_INTERFACE) {
             APP_LOGI(TAG, "MS OS 1.0 property requested len=%u",
                      (unsigned)sizeof(s_ms_os_10_property_descriptor));
             return tud_control_xfer(rhport,
@@ -1247,7 +1285,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
                                     sizeof(s_ms_os_10_property_descriptor));
         }
 
-        if (request->wIndex == 0x0007) {
+        if (request->wIndex == 0x0007 && request->wValue == 0 &&
+            request->bmRequestType_bit.recipient == TUSB_REQ_RCPT_DEVICE) {
             uint16_t total_len;
             memcpy(&total_len, s_ms_os_20_descriptor + 8, sizeof(total_len));
             APP_LOGI(TAG, "MS OS 2.0 descriptor requested len=%u", (unsigned)total_len);

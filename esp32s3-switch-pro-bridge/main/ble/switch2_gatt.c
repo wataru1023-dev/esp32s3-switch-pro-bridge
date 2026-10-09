@@ -1,6 +1,8 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 #include "app_log.h"
 #include "gamepad_axis_math.h"
 #include "switch2_gatt.h"
@@ -28,6 +30,7 @@ typedef struct {
     uint16_t center_ry;
 } axis_calibration_t;
 
+static portMUX_TYPE s_parser_lock = portMUX_INITIALIZER_UNLOCKED;
 static axis_calibration_t s_fd2_axis = {
     .center_lx = CENTER_12BIT,
     .center_ly = CENTER_12BIT,
@@ -42,6 +45,9 @@ static axis_calibration_t s_legacy_axis = {
 };
 static uint8_t s_motion_source_offset = FD2_FULL_MOTION_OFFSET;
 static bool s_motion_full_only = true;
+static bool s_axis_debug_enabled;
+static uint32_t s_axis_debug_every = 32;
+static uint32_t s_axis_debug_seen;
 
 static void axis_calibration_reset(axis_calibration_t *cal)
 {
@@ -57,9 +63,35 @@ static void axis_calibration_reset(axis_calibration_t *cal)
 
 void switch2_gatt_reset_axis_calibration(void)
 {
+    portENTER_CRITICAL(&s_parser_lock);
     axis_calibration_reset(&s_fd2_axis);
     axis_calibration_reset(&s_legacy_axis);
+    portEXIT_CRITICAL(&s_parser_lock);
     APP_LOGI(TAG, "axis calibration reset");
+}
+
+void switch2_gatt_set_axis_debug(bool enabled, uint32_t every)
+{
+    portENTER_CRITICAL(&s_parser_lock);
+    s_axis_debug_enabled = enabled;
+    s_axis_debug_every = every == 0 ? 32 : every;
+    s_axis_debug_seen = 0;
+    uint32_t interval = s_axis_debug_every;
+    portEXIT_CRITICAL(&s_parser_lock);
+    APP_LOGI(TAG, "axis debug %s every=%lu",
+             enabled ? "enabled" : "disabled",
+             (unsigned long)interval);
+}
+
+bool switch2_gatt_get_axis_debug(uint32_t *out_every)
+{
+    portENTER_CRITICAL(&s_parser_lock);
+    if (out_every) {
+        *out_every = s_axis_debug_every;
+    }
+    bool enabled = s_axis_debug_enabled;
+    portEXIT_CRITICAL(&s_parser_lock);
+    return enabled;
 }
 
 bool switch2_gatt_set_motion_source_offset(uint8_t offset)
@@ -67,23 +99,33 @@ bool switch2_gatt_set_motion_source_offset(uint8_t offset)
     if (offset > MOTION_NOTIFY_MAX_OFFSET) {
         return false;
     }
+    portENTER_CRITICAL(&s_parser_lock);
     s_motion_source_offset = offset;
+    portEXIT_CRITICAL(&s_parser_lock);
     return true;
 }
 
 uint8_t switch2_gatt_get_motion_source_offset(void)
 {
-    return s_motion_source_offset;
+    portENTER_CRITICAL(&s_parser_lock);
+    uint8_t offset = s_motion_source_offset;
+    portEXIT_CRITICAL(&s_parser_lock);
+    return offset;
 }
 
 void switch2_gatt_set_motion_full_only(bool enabled)
 {
+    portENTER_CRITICAL(&s_parser_lock);
     s_motion_full_only = enabled;
+    portEXIT_CRITICAL(&s_parser_lock);
 }
 
 bool switch2_gatt_get_motion_full_only(void)
 {
-    return s_motion_full_only;
+    portENTER_CRITICAL(&s_parser_lock);
+    bool enabled = s_motion_full_only;
+    portEXIT_CRITICAL(&s_parser_lock);
+    return enabled;
 }
 
 static uint32_t read_le32(const uint8_t *p)
@@ -138,9 +180,14 @@ static void apply_axes(axis_calibration_t *cal,
                        uint16_t lx,
                        uint16_t ly,
                        uint16_t rx,
-                       uint16_t ry)
+                       uint16_t ry,
+                       bool learn_center)
 {
-    if (!cal->calibrated &&
+    bool learned_now = false;
+    bool log_axes = false;
+    uint32_t sample = 0;
+    portENTER_CRITICAL(&s_parser_lock);
+    if (learn_center && !cal->calibrated &&
         state->buttons == 0 &&
         axes_look_centered(lx, ly, rx, ry)) {
         cal->sum_lx += lx;
@@ -154,14 +201,9 @@ static void apply_axes(axis_calibration_t *cal,
             cal->center_rx = (uint16_t)(cal->sum_rx / cal->sample_count);
             cal->center_ry = (uint16_t)(cal->sum_ry / cal->sample_count);
             cal->calibrated = true;
-            APP_LOGI(TAG, "auto center %s lx=%u ly=%u rx=%u ry=%u",
-                     source,
-                     (unsigned)cal->center_lx,
-                     (unsigned)cal->center_ly,
-                     (unsigned)cal->center_rx,
-                     (unsigned)cal->center_ry);
+            learned_now = true;
         }
-    } else if (!cal->calibrated) {
+    } else if (learn_center && !cal->calibrated) {
         cal->sample_count = 0;
         cal->sum_lx = 0;
         cal->sum_ly = 0;
@@ -169,31 +211,74 @@ static void apply_axes(axis_calibration_t *cal,
         cal->sum_ry = 0;
     }
 
-    if (!cal->calibrated) {
-        state->lx = CENTER_12BIT;
-        state->ly = CENTER_12BIT;
-        state->rx = CENTER_12BIT;
-        state->ry = CENTER_12BIT;
-        return;
+    /*
+     * Do not suppress stick input while the optional center-learning phase is
+     * still running.  The old code forced all four axes to 2048 here until it
+     * had observed 20 consecutive centered frames.  If the controller was
+     * being held, or a button was pressed during connection, that condition
+     * could never be met, leaving buttons alive but all sticks permanently
+     * centered.  Use the factory center as a safe fallback and replace it
+     * with the learned center once calibration completes.
+     */
+    uint16_t center_lx = cal->calibrated ? cal->center_lx : CENTER_12BIT;
+    uint16_t center_ly = cal->calibrated ? cal->center_ly : CENTER_12BIT;
+    uint16_t center_rx = cal->calibrated ? cal->center_rx : CENTER_12BIT;
+    uint16_t center_ry = cal->calibrated ? cal->center_ry : CENTER_12BIT;
+
+    if (learn_center && s_axis_debug_enabled) {
+        sample = ++s_axis_debug_seen;
+        uint32_t every = s_axis_debug_every == 0 ? 32 : s_axis_debug_every;
+        log_axes = every <= 1 || (sample % every) == 0;
+    }
+    portEXIT_CRITICAL(&s_parser_lock);
+
+    if (learned_now) {
+        APP_LOGI(TAG, "auto center %s lx=%u ly=%u rx=%u ry=%u",
+                 source, (unsigned)center_lx, (unsigned)center_ly,
+                 (unsigned)center_rx, (unsigned)center_ry);
     }
 
     state->lx = gamepad_axis_normalize_12bit(
-        lx, cal->center_lx, AXIS_DEADZONE,
+        lx, center_lx, AXIS_DEADZONE,
         GAMEPAD_AXIS_PRO2_FULL_SCALE_RANGE);
     state->ly = gamepad_axis_normalize_12bit(
-        ly, cal->center_ly, AXIS_DEADZONE,
+        ly, center_ly, AXIS_DEADZONE,
         GAMEPAD_AXIS_PRO2_FULL_SCALE_RANGE);
     state->rx = gamepad_axis_normalize_12bit(
-        rx, cal->center_rx, AXIS_DEADZONE,
+        rx, center_rx, AXIS_DEADZONE,
         GAMEPAD_AXIS_PRO2_FULL_SCALE_RANGE);
     state->ry = gamepad_axis_normalize_12bit(
-        ry, cal->center_ry, AXIS_DEADZONE,
+        ry, center_ry, AXIS_DEADZONE,
         GAMEPAD_AXIS_PRO2_FULL_SCALE_RANGE);
+
+    if (log_axes) {
+            APP_LOGI(TAG,
+                     "AXIS_DEBUG src=%s sample=%lu raw=[%u,%u,%u,%u] center=[%u,%u,%u,%u] out=[%u,%u,%u,%u] buttons=0x%08lx",
+                     source,
+                     (unsigned long)sample,
+                     (unsigned)lx,
+                     (unsigned)ly,
+                     (unsigned)rx,
+                     (unsigned)ry,
+                     (unsigned)center_lx,
+                     (unsigned)center_ly,
+                     (unsigned)center_rx,
+                     (unsigned)center_ry,
+                     (unsigned)state->lx,
+                     (unsigned)state->ly,
+                     (unsigned)state->rx,
+                     (unsigned)state->ry,
+                     (unsigned long)state->buttons);
+    }
 }
 
 static void apply_motion_if_available(switch2_state_t *state, const uint8_t *data, uint16_t len)
 {
-    if ((uint16_t)s_motion_source_offset + SWITCH2_MOTION_SAMPLE_SIZE > len) {
+    portENTER_CRITICAL(&s_parser_lock);
+    uint8_t offset = s_motion_source_offset;
+    bool full_only = s_motion_full_only;
+    portEXIT_CRITICAL(&s_parser_lock);
+    if ((uint16_t)offset + SWITCH2_MOTION_SAMPLE_SIZE > len) {
         return;
     }
 
@@ -202,14 +287,15 @@ static void apply_motion_if_available(switch2_state_t *state, const uint8_t *dat
      * accel XYZ followed by gyro XYZ. The USB 0x05 report uses the same
      * 12-byte layout shifted by one byte because report[0] is the report ID.
      */
-    if (s_motion_full_only && len < FD2_FULL_REPORT_MIN_LEN) {
+    if (full_only && len < FD2_FULL_REPORT_MIN_LEN) {
         return;
     }
 
-    switch2_state_set_motion_sample(state, data + s_motion_source_offset, SWITCH2_MOTION_SAMPLE_SIZE);
+    switch2_state_set_motion_sample(state, data + offset, SWITCH2_MOTION_SAMPLE_SIZE);
 }
 
-esp_err_t switch2_gatt_handle_notify(const char *uuid, const uint8_t *data, uint16_t len, switch2_state_t *out_state)
+static esp_err_t parse_report(const char *uuid, const uint8_t *data, uint16_t len,
+                              switch2_state_t *out_state, bool learn_center)
 {
     if (!uuid || !data || !out_state) {
         return ESP_ERR_INVALID_ARG;
@@ -226,7 +312,8 @@ esp_err_t switch2_gatt_handle_notify(const char *uuid, const uint8_t *data, uint
                        unpack12_x(data, 10),
                        unpack12_y(data, 10),
                        unpack12_x(data, 13),
-                       unpack12_y(data, 13));
+                       unpack12_y(data, 13),
+                       learn_center);
         }
         apply_motion_if_available(out_state, data, len);
         return ESP_OK;
@@ -241,12 +328,26 @@ esp_err_t switch2_gatt_handle_notify(const char *uuid, const uint8_t *data, uint
                        unpack12_x(data, 5),
                        unpack12_y(data, 5),
                        unpack12_x(data, 8),
-                       unpack12_y(data, 8));
+                       unpack12_y(data, 8),
+                       learn_center);
         }
         return ESP_OK;
     }
 
     return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t switch2_gatt_handle_notify(const char *uuid, const uint8_t *data,
+                                    uint16_t len, switch2_state_t *out_state)
+{
+    return parse_report(uuid, data, len, out_state, true);
+}
+
+esp_err_t switch2_gatt_parse_diagnostic(const char *uuid, const uint8_t *data,
+                                       uint16_t len, switch2_state_t *out_state)
+{
+    /* Reads can be cached: observe the current centers without training them. */
+    return parse_report(uuid, data, len, out_state, false);
 }
 
 esp_err_t switch2_gatt_send_rumble_stub(const uint8_t *data, uint16_t len)

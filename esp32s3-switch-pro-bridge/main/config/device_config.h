@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 
@@ -21,6 +22,7 @@ void device_config_set_report_rate_hz(uint16_t rate_hz);
 esp_err_t device_config_save_report_rate_hz(uint16_t rate_hz);
 bool device_config_get_ble_autoconnect(void);
 esp_err_t device_config_save_ble_autoconnect(bool enabled);
-const char *device_config_get_ble_target(void);
+/* Copies a synchronized snapshot, always terminating a nonempty output buffer. */
+void device_config_copy_ble_target(char *out, size_t capacity);
 esp_err_t device_config_save_ble_target(const char *target);
 const char *device_config_get_version(void);

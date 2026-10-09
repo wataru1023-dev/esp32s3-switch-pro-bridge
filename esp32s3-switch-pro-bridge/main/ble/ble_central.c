@@ -8,6 +8,7 @@
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
@@ -16,6 +17,7 @@
 #include "host/ble_uuid.h"
 #include "host/util/util.h"
 #include "nimble/ble.h"
+#include "nimble/nimble_npl.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "os/os_mbuf.h"
@@ -24,6 +26,7 @@
 #include "switch2_gatt.h"
 #include "switch2_state.h"
 #include "ble_central.h"
+#include "ble_session_epoch.h"
 
 static const char *TAG = "ble";
 
@@ -116,6 +119,34 @@ static bool s_host_ready;
 static bool s_connected;
 static uint8_t s_own_addr_type;
 static uint16_t s_conn_handle;
+static SemaphoreHandle_t s_ble_state_mutex;
+static ble_session_epoch_t s_connection_epoch;
+static ble_session_epoch_t s_gatt_epoch;
+
+static void ble_state_lock(void)
+{
+    if (s_ble_state_mutex) {
+        xSemaphoreTakeRecursive(s_ble_state_mutex, portMAX_DELAY);
+    }
+}
+
+static void ble_state_unlock(void)
+{
+    if (s_ble_state_mutex) {
+        xSemaphoreGiveRecursive(s_ble_state_mutex);
+    }
+}
+
+static bool gatt_callback_current(uint16_t conn_handle, void *arg)
+{
+    return ble_session_epoch_matches(&s_gatt_epoch, conn_handle,
+                                      (uint32_t)(uintptr_t)arg);
+}
+
+static void *gatt_callback_arg(void)
+{
+    return (void *)(uintptr_t)s_gatt_epoch.generation;
+}
 static uint32_t s_scan_seen_count;
 static scanned_device_t s_scan_cache[BLE_SCAN_CACHE_MAX];
 
@@ -152,7 +183,8 @@ static ble_central_conn_metrics_t s_conn_metrics = {
     .last_connect_status = -1,
     .last_disconnect_reason = -1,
 };
-static bool s_imu_debug_enabled;
+/* Enable raw BLE diagnostics explicitly when troubleshooting input. */
+static bool s_imu_debug_enabled = false;
 static uint32_t s_imu_debug_every = 32;
 static uint32_t s_imu_debug_seen;
 static bool s_last_input_notify_valid;
@@ -216,7 +248,9 @@ static void ble_auto_reconnect_task(void *arg)
     uint32_t attempt = 0;
     TickType_t start_tick = xTaskGetTickCount();
     while (device_config_get_ble_autoconnect()) {
+        ble_state_lock();
         if (s_connected || s_state == BLE_STATE_CONNECTED) {
+            ble_state_unlock();
             break;
         }
 
@@ -240,29 +274,36 @@ static void ble_auto_reconnect_task(void *arg)
                      esp_err_to_name(err));
         }
 
+        ble_state_unlock();
         vTaskDelay(pdMS_TO_TICKS(fast_window ?
                                  BLE_AUTO_RECONNECT_FAST_IDLE_MS :
                                  BLE_AUTO_RECONNECT_SLOW_IDLE_MS));
     }
 
+    ble_state_lock();
     APP_LOGI(TAG, "BLE auto reconnect task stopped state=%s auto=%s",
              ble_central_state_string(),
              device_config_get_ble_autoconnect() ? "on" : "off");
     s_auto_reconnect_task = NULL;
+    ble_state_unlock();
     vTaskDelete(NULL);
 }
 
 static void schedule_auto_reconnect(const char *reason, uint32_t delay_ms)
 {
+    ble_state_lock();
     if (!device_config_get_ble_autoconnect()) {
         APP_LOGI(TAG, "BLE auto reconnect not scheduled reason=%s auto=off",
                  reason ? reason : "<none>");
+        ble_state_unlock();
         return;
     }
     if (s_connected || s_state == BLE_STATE_CONNECTED) {
+        ble_state_unlock();
         return;
     }
     if (s_auto_reconnect_task) {
+        ble_state_unlock();
         return;
     }
 
@@ -276,6 +317,7 @@ static void schedule_auto_reconnect(const char *reason, uint32_t delay_ms)
         s_auto_reconnect_task = NULL;
         APP_LOGE(TAG, "BLE auto reconnect task create failed reason=%s",
                  reason ? reason : "<none>");
+        ble_state_unlock();
         return;
     }
 
@@ -283,6 +325,7 @@ static void schedule_auto_reconnect(const char *reason, uint32_t delay_ms)
     APP_LOGI(TAG, "BLE auto reconnect scheduled reason=%s delay_ms=%lu",
              reason ? reason : "<none>",
              (unsigned long)delay_ms);
+    ble_state_unlock();
 }
 
 static void handle_auto_reconnect_after_drop(const char *reason)
@@ -343,6 +386,7 @@ static void ble_auto_connect_selected(void *arg)
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 
+    ble_state_lock();
     if (!s_connected && s_auto_scan_target_valid) {
         ble_addr_t target = s_auto_scan_target;
         char label[sizeof(s_auto_scan_label)];
@@ -357,6 +401,7 @@ static void ble_auto_connect_selected(void *arg)
     }
 
     s_auto_connect_selected_task = NULL;
+    ble_state_unlock();
     vTaskDelete(NULL);
 }
 
@@ -697,7 +742,7 @@ static void record_read_poll_payload(const uint8_t *data, uint16_t len, int64_t 
 
     switch2_state_t state;
     switch2_state_reset(&state);
-    esp_err_t err = switch2_gatt_handle_notify(SWITCH2_NOTIFY_FD2_UUID, data, len, &state);
+    esp_err_t err = switch2_gatt_parse_diagnostic(SWITCH2_NOTIFY_FD2_UUID, data, len, &state);
     if (err != ESP_OK) {
         return;
     }
@@ -744,17 +789,22 @@ static int gatt_read_poll_cb(uint16_t conn_handle,
                              struct ble_gatt_attr *attr,
                              void *arg)
 {
-    (void)conn_handle;
-    (void)arg;
+    ble_state_lock();
+    if (!gatt_callback_current(conn_handle, arg)) {
+        ble_state_unlock();
+        return 0;
+    }
 
     int status = error ? error->status : -1;
     s_conn_metrics.read_poll_last_status = status;
     if (status != 0) {
         s_conn_metrics.read_poll_error_count++;
+        ble_state_unlock();
         return 0;
     }
     if (!attr || !attr->om) {
         s_conn_metrics.read_poll_error_count++;
+        ble_state_unlock();
         return 0;
     }
 
@@ -765,49 +815,61 @@ static int gatt_read_poll_cb(uint16_t conn_handle,
     if (rc != 0) {
         s_conn_metrics.read_poll_error_count++;
         APP_LOGW(TAG, "BLE read-poll copy failed len=%u rc=%d", len, rc);
+        ble_state_unlock();
         return 0;
     }
 
     record_read_poll_payload(data, copy_len, esp_timer_get_time());
+    ble_state_unlock();
     return 0;
 }
 
+typedef struct {
+    uint16_t rate_hz;
+    uint16_t conn_handle;
+    uint32_t generation;
+} read_poll_context_t;
+
 static void read_poll_task(void *arg)
 {
-    uint16_t rate_hz = (uint16_t)(uintptr_t)arg;
-    if (rate_hz < BLE_READ_POLL_MIN_HZ) {
-        rate_hz = BLE_READ_POLL_MIN_HZ;
-    }
+    read_poll_context_t context = *(read_poll_context_t *)arg;
+    free(arg);
+    uint16_t rate_hz = context.rate_hz;
     uint32_t period_ms = 1000u / rate_hz;
     if (period_ms == 0) {
         period_ms = 1;
     }
 
-    APP_LOGI(TAG, "BLE read-poll task started rate_hz=%u handle=0x%04x",
-             (unsigned)rate_hz,
-             (unsigned)s_input_val_handle);
-
-    while (s_conn_metrics.read_poll_active && s_connected && s_input_val_handle) {
-        int rc = ble_gattc_read(s_conn_handle,
+    APP_LOGI(TAG, "BLE read-poll task started rate_hz=%u", (unsigned)rate_hz);
+    for (;;) {
+        ble_state_lock();
+        if (!s_conn_metrics.read_poll_active || !s_connected || !s_input_val_handle ||
+            !ble_session_epoch_matches(&s_gatt_epoch, context.conn_handle,
+                                         context.generation)) {
+            ble_state_unlock();
+            break;
+        }
+        int rc = ble_gattc_read(context.conn_handle,
                                 s_input_val_handle,
                                 gatt_read_poll_cb,
-                                NULL);
+                                (void *)(uintptr_t)context.generation);
         s_conn_metrics.read_poll_last_start_rc = rc;
         if (rc == 0) {
             s_conn_metrics.read_poll_start_count++;
         } else {
             s_conn_metrics.read_poll_start_fail_count++;
         }
+        ble_state_unlock();
         vTaskDelay(pdMS_TO_TICKS(period_ms));
     }
 
-    s_conn_metrics.read_poll_active = false;
-    APP_LOGI(TAG, "BLE read-poll task stopped starts=%lu fails=%lu rsp=%lu errors=%lu",
-             (unsigned long)s_conn_metrics.read_poll_start_count,
-             (unsigned long)s_conn_metrics.read_poll_start_fail_count,
-             (unsigned long)s_conn_metrics.read_poll_rsp_count,
-             (unsigned long)s_conn_metrics.read_poll_error_count);
+    ble_state_lock();
+    if (s_gatt_epoch.generation == context.generation) {
+        s_conn_metrics.read_poll_active = false;
+    }
+    APP_LOGI(TAG, "BLE read-poll task stopped");
     s_read_poll_task = NULL;
+    ble_state_unlock();
     vTaskDelete(NULL);
 }
 
@@ -855,7 +917,9 @@ static void record_notify_gap_bucket(uint32_t gap_us)
 
 static esp_err_t request_fast_conn_params_internal(const char *reason)
 {
+    ble_state_lock();
     if (!s_connected) {
+        ble_state_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -868,6 +932,7 @@ static esp_err_t request_fast_conn_params_internal(const char *reason)
                  reason,
                  (unsigned long)blocked_ms,
                  (unsigned long)s_conn_metrics.fast_param_drop_count);
+        ble_state_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -887,6 +952,7 @@ static esp_err_t request_fast_conn_params_internal(const char *reason)
              s_fast_update_params.latency,
              s_fast_update_params.supervision_timeout,
              rc);
+    ble_state_unlock();
     return rc == 0 ? ESP_OK : ESP_FAIL;
 }
 
@@ -1104,6 +1170,8 @@ static bool is_rumble_uuid(const char *uuid)
 
 static void clear_gatt_cache(void)
 {
+    ble_session_epoch_invalidate(&s_gatt_epoch);
+    ble_central_stop_read_poll_probe();
     memset(s_services, 0, sizeof(s_services));
     memset(s_chars, 0, sizeof(s_chars));
     s_service_count = 0;
@@ -1462,7 +1530,9 @@ static void json_escape_small(const char *in, char *out, size_t out_len)
 
 void ble_central_format_scan_results_json(char *out, size_t out_len)
 {
+    ble_state_lock();
     if (!out || out_len == 0) {
+        ble_state_unlock();
         return;
     }
 
@@ -1471,6 +1541,7 @@ void ble_central_format_scan_results_json(char *out, size_t out_len)
                                    (unsigned long)s_scan_seen_count);
     if (used >= out_len) {
         out[out_len - 1] = 0;
+        ble_state_unlock();
         return;
     }
 
@@ -1511,6 +1582,7 @@ void ble_central_format_scan_results_json(char *out, size_t out_len)
                                best->candidate ? "true" : "false");
         if (written < 0 || (size_t)written >= out_len - used) {
             out[out_len - 1] = 0;
+            ble_state_unlock();
             return;
         }
         used += (size_t)written;
@@ -1518,6 +1590,7 @@ void ble_central_format_scan_results_json(char *out, size_t out_len)
     }
 
     snprintf(out + used, out_len - used, "]");
+    ble_state_unlock();
 }
 
 static discovered_char_t *find_chr_by_value_handle(uint16_t value_handle)
@@ -1556,34 +1629,34 @@ static void start_post_init_subscriptions(void);
 static void send_current_init_command(void);
 static void subscribe_next_target(void);
 
-static volatile bool s_subscribe_task_pending;
+static struct ble_npl_event s_subscribe_event;
+static bool s_subscribe_event_pending;
+static uint32_t s_subscribe_event_generation;
 
-static void subscribe_next_task(void *arg)
+static void subscribe_next_event(struct ble_npl_event *event)
 {
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(1));
-    s_subscribe_task_pending = false;
-    subscribe_next_target();
-    vTaskDelete(NULL);
+    (void)event;
+    ble_state_lock();
+    uint32_t generation = s_subscribe_event_generation;
+    s_subscribe_event_pending = false;
+    if (ble_session_epoch_matches(&s_gatt_epoch, s_conn_handle, generation)) {
+        subscribe_next_target();
+    }
+    ble_state_unlock();
 }
 
 static void schedule_subscribe_next(void)
 {
-    if (s_subscribe_task_pending) {
+    if (!s_gatt_epoch.active) {
         return;
     }
-
-    s_subscribe_task_pending = true;
-    BaseType_t ok = xTaskCreate(subscribe_next_task,
-                                "ble_sub_next",
-                                4096,
-                                NULL,
-                                5,
-                                NULL);
-    if (ok != pdPASS) {
-        s_subscribe_task_pending = false;
-        APP_LOGE(TAG, "BLE subscribe scheduler failed");
+    /* A queued stale event can carry the current session's pending request. */
+    s_subscribe_event_generation = s_gatt_epoch.generation;
+    if (s_subscribe_event_pending) {
+        return;
     }
+    s_subscribe_event_pending = true;
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_subscribe_event);
 }
 
 static bool subscribe_target_for_phase(const discovered_char_t *chr)
@@ -1596,6 +1669,10 @@ static bool subscribe_target_for_phase(const discovered_char_t *chr)
 
 static void subscribe_next_target(void)
 {
+    if (!s_gatt_epoch.active || !s_connected) {
+        return;
+    }
+
     uint8_t enable_notify[2] = {0x01, 0x00};
 
     for (int i = s_subscribe_index + 1; i < (int)s_char_count; i++) {
@@ -1611,7 +1688,7 @@ static void subscribe_next_target(void)
                                       enable_notify,
                                       sizeof(enable_notify),
                                       gatt_subscribe_write_cb,
-                                      NULL);
+                                      gatt_callback_arg());
         if (rc != 0) {
             APP_LOGW(TAG, "BLE subscribe start failed uuid=%s cccd=0x%04x rc=%d",
                      chr->uuid,
@@ -1726,9 +1803,13 @@ static int gatt_subscribe_write_cb(uint16_t conn_handle,
                                    struct ble_gatt_attr *attr,
                                    void *arg)
 {
-    (void)conn_handle;
+    ble_state_lock();
+    if (!gatt_callback_current(conn_handle, arg)) {
+        ble_state_unlock();
+        return 0;
+    }
+
     (void)attr;
-    (void)arg;
 
     if (s_subscribe_index >= 0 && s_subscribe_index < (int)s_char_count) {
         discovered_char_t *chr = &s_chars[s_subscribe_index];
@@ -1741,6 +1822,7 @@ static int gatt_subscribe_write_cb(uint16_t conn_handle,
     }
 
     schedule_subscribe_next();
+    ble_state_unlock();
     return 0;
 }
 
@@ -1752,11 +1834,16 @@ static int gatt_dsc_cb(uint16_t conn_handle,
                        const struct ble_gatt_dsc *dsc,
                        void *arg)
 {
-    (void)conn_handle;
+    ble_state_lock();
+    if (!gatt_callback_current(conn_handle, arg)) {
+        ble_state_unlock();
+        return 0;
+    }
+
     (void)chr_val_handle;
-    (void)arg;
 
     if (s_desc_chr_index < 0 || s_desc_chr_index >= (int)s_char_count) {
+        ble_state_unlock();
         return 0;
     }
 
@@ -1772,21 +1859,28 @@ static int gatt_dsc_cb(uint16_t conn_handle,
             ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16) {
             chr->cccd_handle = dsc->handle;
         }
+        ble_state_unlock();
         return 0;
     }
 
     if (error->status == BLE_HS_EDONE) {
         start_next_descriptor_discovery();
+        ble_state_unlock();
         return 0;
     }
 
     APP_LOGW(TAG, "BLE descriptor discovery failed chr=%s status=%d", chr->uuid, error->status);
     start_next_descriptor_discovery();
+    ble_state_unlock();
     return 0;
 }
 
 static void start_next_descriptor_discovery(void)
 {
+    if (!s_gatt_epoch.active || !s_connected) {
+        return;
+    }
+
     for (int i = s_desc_chr_index + 1; i < (int)s_char_count; i++) {
         discovered_char_t *chr = &s_chars[i];
         if (!chr->notify_target || chr->end_handle <= chr->val_handle) {
@@ -1798,7 +1892,7 @@ static void start_next_descriptor_discovery(void)
                                          chr->val_handle,
                                          chr->end_handle,
                                          gatt_dsc_cb,
-                                         NULL);
+                                         gatt_callback_arg());
         if (rc != 0) {
             APP_LOGW(TAG, "BLE descriptor discovery start failed chr=%s rc=%d", chr->uuid, rc);
             continue;
@@ -1822,12 +1916,17 @@ static int gatt_chr_cb(uint16_t conn_handle,
                        const struct ble_gatt_chr *chr,
                        void *arg)
 {
-    (void)conn_handle;
-    (void)arg;
+    ble_state_lock();
+    if (!gatt_callback_current(conn_handle, arg)) {
+        ble_state_unlock();
+        return 0;
+    }
+
 
     if (error->status == 0) {
         if (s_char_count >= BLE_MAX_CHARS) {
             APP_LOGW(TAG, "BLE characteristic cache full; skipping value=0x%04x", chr->val_handle);
+            ble_state_unlock();
             return 0;
         }
 
@@ -1866,23 +1965,30 @@ static int gatt_chr_cb(uint16_t conn_handle,
                  (out->command_target ? "cmd" :
                  (out->rumble_target ? "rumble" : "no"))),
                  (out->properties & BLE_GATT_CHR_F_READ) ? "yes" : "no");
+        ble_state_unlock();
         return 0;
     }
 
     if (error->status == BLE_HS_EDONE) {
         s_disc_service_index++;
         start_next_characteristic_discovery();
+        ble_state_unlock();
         return 0;
     }
 
     APP_LOGW(TAG, "BLE characteristic discovery failed status=%d", error->status);
     s_disc_service_index++;
     start_next_characteristic_discovery();
+    ble_state_unlock();
     return 0;
 }
 
 static void start_next_characteristic_discovery(void)
 {
+    if (!s_gatt_epoch.active || !s_connected) {
+        return;
+    }
+
     while (s_disc_service_index < s_service_count) {
         discovered_service_t *svc = &s_services[s_disc_service_index];
         if (svc->end_handle <= svc->start_handle) {
@@ -1894,7 +2000,7 @@ static void start_next_characteristic_discovery(void)
                                          svc->start_handle,
                                          svc->end_handle,
                                          gatt_chr_cb,
-                                         NULL);
+                                         gatt_callback_arg());
         if (rc != 0) {
             APP_LOGW(TAG, "BLE characteristic discovery start failed svc=%s rc=%d", svc->uuid, rc);
             s_disc_service_index++;
@@ -1919,12 +2025,17 @@ static int gatt_svc_cb(uint16_t conn_handle,
                        const struct ble_gatt_svc *service,
                        void *arg)
 {
-    (void)conn_handle;
-    (void)arg;
+    ble_state_lock();
+    if (!gatt_callback_current(conn_handle, arg)) {
+        ble_state_unlock();
+        return 0;
+    }
+
 
     if (error->status == 0) {
         if (s_service_count >= BLE_MAX_SERVICES) {
             APP_LOGW(TAG, "BLE service cache full; skipping start=0x%04x", service->start_handle);
+            ble_state_unlock();
             return 0;
         }
 
@@ -1936,6 +2047,7 @@ static int gatt_svc_cb(uint16_t conn_handle,
                  out->start_handle,
                  out->end_handle,
                  out->uuid);
+        ble_state_unlock();
         return 0;
     }
 
@@ -1943,16 +2055,18 @@ static int gatt_svc_cb(uint16_t conn_handle,
         APP_LOGI(TAG, "BLE service discovery complete services=%u", (unsigned)s_service_count);
         s_disc_service_index = 0;
         start_next_characteristic_discovery();
+        ble_state_unlock();
         return 0;
     }
 
     APP_LOGW(TAG, "BLE service discovery failed status=%d", error->status);
+    ble_state_unlock();
     return 0;
 }
 
 static void start_service_discovery(uint16_t conn_handle)
 {
-    int rc = ble_gattc_disc_all_svcs(conn_handle, gatt_svc_cb, NULL);
+    int rc = ble_gattc_disc_all_svcs(conn_handle, gatt_svc_cb, gatt_callback_arg());
     if (rc != 0) {
         APP_LOGE(TAG, "BLE service discovery start failed rc=%d", rc);
     } else {
@@ -1965,22 +2079,28 @@ static int gatt_mtu_cb(uint16_t conn_handle,
                        uint16_t mtu,
                        void *arg)
 {
-    (void)conn_handle;
-    (void)arg;
+    ble_state_lock();
+    if (!gatt_callback_current(conn_handle, arg)) {
+        ble_state_unlock();
+        return 0;
+    }
+
     if (error->status == 0) {
         APP_LOGI(TAG, "BLE MTU exchange ok mtu=%u", mtu);
     } else {
         APP_LOGW(TAG, "BLE MTU exchange failed status=%d", error->status);
     }
     start_service_discovery(conn_handle);
+    ble_state_unlock();
     return 0;
 }
 
 static void start_gatt_discovery(uint16_t conn_handle)
 {
     clear_gatt_cache();
+    ble_session_epoch_activate(&s_gatt_epoch, conn_handle);
 
-    int rc = ble_gattc_exchange_mtu(conn_handle, gatt_mtu_cb, NULL);
+    int rc = ble_gattc_exchange_mtu(conn_handle, gatt_mtu_cb, gatt_callback_arg());
     if (rc != 0) {
         APP_LOGW(TAG, "BLE MTU exchange start failed rc=%d", rc);
         start_service_discovery(conn_handle);
@@ -1991,6 +2111,10 @@ static void start_gatt_discovery(uint16_t conn_handle)
 
 static void handle_notify_rx(const struct ble_gap_event *event)
 {
+    if (!s_gatt_epoch.active ||
+        event->notify_rx.conn_handle != s_gatt_epoch.conn_handle) {
+        return;
+    }
     s_conn_metrics.notify_rx_count++;
     int64_t now_us = esp_timer_get_time();
     uint32_t notify_gap_us = 0;
@@ -2036,10 +2160,33 @@ static void handle_notify_rx(const struct ble_gap_event *event)
     discovered_char_t *chr = find_chr_by_value_handle(event->notify_rx.attr_handle);
     const char *uuid = chr ? chr->uuid : "<unknown>";
 
-    if (s_imu_debug_enabled && chr && is_input_uuid(uuid) && copy_len >= 51) {
+    if (s_imu_debug_enabled && chr && is_input_uuid(uuid)) {
         s_imu_debug_seen++;
         uint32_t every = s_imu_debug_every == 0 ? 32 : s_imu_debug_every;
         if (every <= 1 || (s_imu_debug_seen % every) == 0) {
+            static char raw_input_hex[256];
+            format_hex_full(data, copy_len, raw_input_hex, sizeof(raw_input_hex));
+            uint16_t lx = 0;
+            uint16_t ly = 0;
+            uint16_t rx = 0;
+            uint16_t ry = 0;
+            if (copy_len >= 16) {
+                lx = (uint16_t)data[10] | (uint16_t)((data[11] & 0x0f) << 8);
+                ly = (uint16_t)((data[11] >> 4) & 0x0f) | (uint16_t)(data[12] << 4);
+                rx = (uint16_t)data[13] | (uint16_t)((data[14] & 0x0f) << 8);
+                ry = (uint16_t)((data[14] >> 4) & 0x0f) | (uint16_t)(data[15] << 4);
+            }
+            APP_LOGI(TAG,
+                     "AXIS_RAW_DEBUG notify=%lu uuid=%s len=%u candidate_raw=[%u,%u,%u,%u] raw=\"%s\"",
+                     (unsigned long)s_imu_debug_seen,
+                     uuid,
+                     (unsigned)copy_len,
+                     (unsigned)lx,
+                     (unsigned)ly,
+                     (unsigned)rx,
+                     (unsigned)ry,
+                     raw_input_hex);
+            if (copy_len >= 51) {
             static char imu_hex[128];
             static char motion_hex[128];
             static char imu_i16[192];
@@ -2077,6 +2224,7 @@ static void handle_notify_rx(const struct ble_gap_event *event)
                      fd2_motion_hex,
                      fd2_motion_i16,
                      raw_hex);
+            }
         }
     }
 
@@ -2150,11 +2298,43 @@ static void handle_notify_rx(const struct ble_gap_event *event)
 
 static int ble_gap_event(struct ble_gap_event *event, void *arg)
 {
-    (void)arg;
+    ble_state_lock();
+    uint32_t generation = (uint32_t)(uintptr_t)arg;
+    if (event->type == BLE_GAP_EVENT_CONNECT) {
+        if (!s_connection_epoch.active ||
+            generation != s_connection_epoch.generation) {
+            if (event->connect.status == 0 &&
+                (!s_connected || event->connect.conn_handle != s_conn_handle)) {
+                /* A cancelled attempt may have finished before cancellation. */
+                int rc = ble_gap_terminate(event->connect.conn_handle,
+                                           BLE_ERR_REM_USER_CONN_TERM);
+                APP_LOGW(TAG, "BLE stale connect cleaned up handle=%u rc=%d",
+                         event->connect.conn_handle, rc);
+            }
+            ble_state_unlock();
+            return 0;
+        }
+    } else if (event->type == BLE_GAP_EVENT_DISCONNECT ||
+               event->type == BLE_GAP_EVENT_NOTIFY_RX ||
+               event->type == BLE_GAP_EVENT_CONN_UPDATE ||
+               event->type == BLE_GAP_EVENT_CONN_UPDATE_REQ ||
+               event->type == BLE_GAP_EVENT_MTU) {
+        uint16_t conn_handle = event->type == BLE_GAP_EVENT_DISCONNECT ?
+            event->disconnect.conn.conn_handle :
+            event->type == BLE_GAP_EVENT_NOTIFY_RX ? event->notify_rx.conn_handle :
+            event->type == BLE_GAP_EVENT_CONN_UPDATE ? event->conn_update.conn_handle :
+            event->type == BLE_GAP_EVENT_CONN_UPDATE_REQ ? event->conn_update_req.conn_handle :
+            event->mtu.conn_handle;
+        if (!ble_session_epoch_matches(&s_connection_epoch, conn_handle, generation)) {
+            ble_state_unlock();
+            return 0;
+        }
+    }
 
     switch (event->type) {
     case BLE_GAP_EVENT_DISC:
         log_adv_report(&event->disc);
+        ble_state_unlock();
         return 0;
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
@@ -2185,6 +2365,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
                                         BLE_AUTO_RECONNECT_SLOW_IDLE_MS);
             }
         }
+        ble_state_unlock();
         return 0;
         }
 
@@ -2193,6 +2374,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_connected = true;
             s_conn_handle = event->connect.conn_handle;
+            ble_session_epoch_activate(&s_connection_epoch, s_conn_handle);
             s_state = BLE_STATE_CONNECTED;
             s_conn_metrics.connect_success_count++;
             s_conn_metrics.last_connect_us = esp_timer_get_time();
@@ -2212,11 +2394,13 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
             s_conn_handle = 0;
             s_state = BLE_STATE_IDLE;
             s_pending_connect_valid = false;
+            ble_session_epoch_invalidate(&s_connection_epoch);
             s_conn_metrics.connect_failure_count++;
             clear_conn_metrics();
             APP_LOGW(TAG, "BLE connect failed status=%d", event->connect.status);
             handle_auto_reconnect_after_drop("connect_failed");
         }
+        ble_state_unlock();
         return 0;
 
     case BLE_GAP_EVENT_CONN_UPDATE:
@@ -2225,6 +2409,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
                  event->conn_update.conn_handle,
                  event->conn_update.status);
         update_conn_metrics_from_desc(event->conn_update.conn_handle, "update");
+        ble_state_unlock();
         return 0;
 
     case BLE_GAP_EVENT_CONN_UPDATE_REQ:
@@ -2248,10 +2433,12 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         if (event->conn_update_req.self_params) {
             *event->conn_update_req.self_params = *selected_params;
         }
+        ble_state_unlock();
         return 0;
         }
 
     case BLE_GAP_EVENT_DISCONNECT:
+        ble_session_epoch_invalidate(&s_connection_epoch);
         ble_central_stop_read_poll_probe();
         s_conn_metrics.disconnect_count++;
         s_conn_metrics.last_disconnect_reason = event->disconnect.reason;
@@ -2261,29 +2448,36 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         s_conn_handle = 0;
         s_state = BLE_STATE_IDLE;
         clear_gatt_cache();
+        switch2_gatt_reset_axis_calibration();
         switch2_state_clear_live();
         clear_conn_metrics();
         APP_LOGI(TAG, "BLE disconnected reason=%d", event->disconnect.reason);
         handle_auto_reconnect_after_drop("disconnect");
+        ble_state_unlock();
         return 0;
 
     case BLE_GAP_EVENT_NOTIFY_RX:
         handle_notify_rx(event);
+        ble_state_unlock();
         return 0;
 
     case BLE_GAP_EVENT_MTU:
         APP_LOGI(TAG, "BLE MTU event conn=%u mtu=%u",
                  event->mtu.conn_handle,
                  event->mtu.value);
+        ble_state_unlock();
         return 0;
 
     default:
+        ble_state_unlock();
         return 0;
     }
 }
 
 static void ble_on_reset(int reason)
 {
+    ble_state_lock();
+    ble_session_epoch_invalidate(&s_connection_epoch);
     s_host_ready = false;
     s_connected = false;
     s_state = BLE_STATE_IDLE;
@@ -2292,28 +2486,34 @@ static void ble_on_reset(int reason)
     s_auto_scan_preferred_valid = false;
     s_pending_connect_valid = false;
     clear_gatt_cache();
+    switch2_gatt_reset_axis_calibration();
     switch2_state_clear_live();
     clear_conn_metrics();
     APP_LOGW(TAG, "NimBLE reset reason=%d", reason);
+    ble_state_unlock();
 }
 
 static void ble_on_sync(void)
 {
+    ble_state_lock();
     int rc = ble_hs_util_ensure_addr(0);
     if (rc != 0) {
         APP_LOGE(TAG, "NimBLE cannot ensure identity addr rc=%d", rc);
+        ble_state_unlock();
         return;
     }
 
     rc = ble_hs_id_infer_auto(0, &s_own_addr_type);
     if (rc != 0) {
         APP_LOGE(TAG, "NimBLE cannot infer own addr type rc=%d", rc);
+        ble_state_unlock();
         return;
     }
 
     s_host_ready = true;
     APP_LOGI(TAG, "NimBLE host ready own_addr_type=%u", s_own_addr_type);
     schedule_auto_reconnect("host_sync", BLE_AUTO_RECONNECT_INITIAL_DELAY_MS);
+    ble_state_unlock();
 }
 
 static void ble_host_task(void *param)
@@ -2326,6 +2526,12 @@ static void ble_host_task(void *param)
 
 void ble_central_init(void)
 {
+    s_ble_state_mutex = xSemaphoreCreateRecursiveMutex();
+    if (!s_ble_state_mutex) {
+        APP_LOGE(TAG, "BLE state mutex allocation failed");
+        return;
+    }
+    ble_session_epoch_invalidate(&s_connection_epoch);
     s_state = BLE_STATE_IDLE;
     s_host_ready = false;
     s_connected = false;
@@ -2348,6 +2554,7 @@ void ble_central_init(void)
         return;
     }
 
+    ble_npl_event_init(&s_subscribe_event, subscribe_next_event, NULL);
     ble_hs_cfg.reset_cb = ble_on_reset;
     ble_hs_cfg.sync_cb = ble_on_sync;
 
@@ -2362,7 +2569,9 @@ void ble_central_init(void)
 
 static esp_err_t ble_central_connect_addr(const ble_addr_t *target, const char *label)
 {
+    ble_state_lock();
     if (!target) {
+        ble_state_unlock();
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -2381,13 +2590,15 @@ static esp_err_t ble_central_connect_addr(const ble_addr_t *target, const char *
     }
 
     if (s_connected) {
-        int term_rc = ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        if (term_rc != 0) {
-            APP_LOGW(TAG, "BLE existing connection terminate rc=%d", term_rc);
-        }
+        APP_LOGW(TAG, "BLE connect ignored while connected; disconnect first");
+        ble_state_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
 
     clear_gatt_cache();
+    ble_session_epoch_invalidate(&s_connection_epoch);
+    ble_session_epoch_activate(&s_connection_epoch, UINT16_MAX);
+    switch2_gatt_reset_axis_calibration();
     switch2_state_clear_live();
     s_pending_connect_addr = *target;
     s_pending_connect_valid = true;
@@ -2397,14 +2608,18 @@ static esp_err_t ble_central_connect_addr(const ble_addr_t *target, const char *
              label ? label : "<addr>",
              BLE_CONNECT_TIMEOUT_MS);
 
-    int rc = ble_gap_connect(s_own_addr_type, target, BLE_CONNECT_TIMEOUT_MS, &s_safe_connect_params, ble_gap_event, NULL);
+    int rc = ble_gap_connect(s_own_addr_type, target, BLE_CONNECT_TIMEOUT_MS, &s_safe_connect_params, ble_gap_event, (void *)(uintptr_t)s_connection_epoch.generation);
     s_conn_metrics.last_connect_start_rc = rc;
     if (rc != 0) {
         s_state = BLE_STATE_IDLE;
         s_pending_connect_valid = false;
+        ble_session_epoch_invalidate(&s_connection_epoch);
         APP_LOGE(TAG, "BLE connect start failed rc=%d", rc);
+        ble_state_unlock();
         return ESP_FAIL;
     }
+
+    ble_state_unlock();
 
     return ESP_OK;
 }
@@ -2413,18 +2628,22 @@ static esp_err_t ble_central_start_scan_internal(bool auto_connect,
                                                 const ble_addr_t *preferred,
                                                 uint32_t duration_ms)
 {
+    ble_state_lock();
     if (!s_host_ready) {
         APP_LOGW(TAG, "BLE scan requested before NimBLE sync");
+        ble_state_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
     if (s_connected || s_state == BLE_STATE_CONNECTED) {
         APP_LOGW(TAG, "BLE scan ignored while connected; disconnect first");
+        ble_state_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
     if (s_state == BLE_STATE_CONNECTING || ble_gap_conn_active()) {
         APP_LOGW(TAG, "BLE scan ignored while a connection attempt is in progress");
+        ble_state_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2465,10 +2684,12 @@ static esp_err_t ble_central_start_scan_internal(bool auto_connect,
         s_auto_scan_target_valid = false;
         s_auto_scan_preferred_valid = false;
         APP_LOGE(TAG, "BLE scan start failed rc=%d", rc);
+        ble_state_unlock();
         return ESP_FAIL;
     }
 
     s_conn_metrics.scan_start_count++;
+    ble_state_unlock();
     return ESP_OK;
 }
 
@@ -2479,11 +2700,13 @@ esp_err_t ble_central_start_scan(void)
 
 static esp_err_t ble_central_start_wake_scan(uint32_t duration_ms)
 {
-    const char *saved_target = device_config_get_ble_target();
+    ble_state_lock();
+    char saved_target[40];
+    device_config_copy_ble_target(saved_target, sizeof(saved_target));
     ble_addr_t preferred;
     bool preferred_valid = false;
 
-    if (saved_target && saved_target[0] && strchr(saved_target, ':')) {
+    if (saved_target[0] && strchr(saved_target, ':')) {
         bool type_set = false;
         if (parse_addr_text(saved_target, &preferred, &type_set)) {
             if (!type_set) {
@@ -2497,17 +2720,23 @@ static esp_err_t ble_central_start_wake_scan(uint32_t duration_ms)
         char addr[32];
         format_addr(&preferred, addr, sizeof(addr));
         APP_LOGI(TAG, "BLE wake scan prefers saved target=%s", addr);
-        return ble_central_start_scan_internal(true, &preferred, duration_ms);
+        esp_err_t result = ble_central_start_scan_internal(true, &preferred, duration_ms);
+        ble_state_unlock();
+        return result;
     }
 
     APP_LOGI(TAG, "BLE wake scan has no saved address; using first candidate");
-    return ble_central_start_scan_internal(true, NULL, duration_ms);
+    esp_err_t result = ble_central_start_scan_internal(true, NULL, duration_ms);
+    ble_state_unlock();
+    return result;
 }
 
 esp_err_t ble_central_connect(const char *address_or_name)
 {
+    ble_state_lock();
     if (!s_host_ready) {
         APP_LOGW(TAG, "BLE connect requested before NimBLE sync");
+        ble_state_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2515,27 +2744,37 @@ esp_err_t ble_central_connect(const char *address_or_name)
     char label[96];
     if (!select_connect_target(address_or_name, &target, label, sizeof(label))) {
         APP_LOGW(TAG, "BLE connect target not found target=%s", address_or_name ? address_or_name : "<last>");
+        ble_state_unlock();
         return ESP_ERR_NOT_FOUND;
     }
 
-    return ble_central_connect_addr(&target, label);
+    esp_err_t result = ble_central_connect_addr(&target, label);
+    ble_state_unlock();
+    return result;
 }
 
 esp_err_t ble_central_reconnect_saved_or_scan(void)
 {
+    ble_state_lock();
     if (s_connected || s_state == BLE_STATE_CONNECTED) {
         APP_LOGI(TAG, "BLE reconnect skipped; already connected");
+        ble_state_unlock();
         return ESP_OK;
     }
 
-    const char *saved_target = device_config_get_ble_target();
-    if (saved_target && saved_target[0]) {
+    char saved_target[40];
+    device_config_copy_ble_target(saved_target, sizeof(saved_target));
+    if (saved_target[0]) {
         APP_LOGI(TAG, "BLE reconnect scanning for saved target=%s", saved_target);
-        return ble_central_start_wake_scan(BLE_AUTO_RECONNECT_FAST_SCAN_MS);
+        esp_err_t result = ble_central_start_wake_scan(BLE_AUTO_RECONNECT_FAST_SCAN_MS);
+        ble_state_unlock();
+        return result;
     }
 
     APP_LOGI(TAG, "BLE reconnect has no saved target; scanning for first candidate");
-    return ble_central_start_scan_internal(true, NULL, BLE_SCAN_DURATION_MS);
+    esp_err_t result = ble_central_start_scan_internal(true, NULL, BLE_SCAN_DURATION_MS);
+    ble_state_unlock();
+    return result;
 }
 
 void ble_central_start_auto_reconnect(void)
@@ -2545,6 +2784,7 @@ void ble_central_start_auto_reconnect(void)
 
 void ble_central_disconnect(void)
 {
+    ble_state_lock();
     ble_central_stop_read_poll_probe();
     s_auto_scan_connect = false;
     s_auto_scan_target_valid = false;
@@ -2564,13 +2804,22 @@ void ble_central_disconnect(void)
     if (s_connected) {
         (void)ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
+    clear_gatt_cache();
+    switch2_gatt_reset_axis_calibration();
+    switch2_state_clear_live();
+    if (!s_connected) {
+        ble_session_epoch_invalidate(&s_connection_epoch);
+    }
     s_state = BLE_STATE_IDLE;
     APP_LOGI(TAG, "BLE disconnect requested");
+    ble_state_unlock();
 }
 
 esp_err_t ble_central_recover_stale_link(void)
 {
+    ble_state_lock();
     if (!s_connected || s_state != BLE_STATE_CONNECTED) {
+        ble_state_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2578,6 +2827,8 @@ esp_err_t ble_central_recover_stale_link(void)
     s_conn_metrics.stale_recovery_count++;
     s_conn_metrics.last_stale_recovery_us = now_us;
     s_suppress_next_auto_reconnect = false;
+    clear_gatt_cache();
+    switch2_gatt_reset_axis_calibration();
     switch2_state_clear_live();
 
     int rc = ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
@@ -2587,9 +2838,11 @@ esp_err_t ble_central_recover_stale_link(void)
              rc,
              (unsigned long)s_conn_metrics.stale_recovery_count);
     if (rc == 0) {
+        ble_state_unlock();
         return ESP_OK;
     }
 
+    ble_session_epoch_invalidate(&s_connection_epoch);
     s_connected = false;
     s_conn_handle = 0;
     s_state = BLE_STATE_IDLE;
@@ -2597,6 +2850,7 @@ esp_err_t ble_central_recover_stale_link(void)
     clear_gatt_cache();
     clear_conn_metrics();
     handle_auto_reconnect_after_drop("stale_notify_terminate_failed");
+    ble_state_unlock();
     return ESP_FAIL;
 }
 
@@ -2607,36 +2861,57 @@ esp_err_t ble_central_request_fast_params(void)
 
 void ble_central_reset_multi_probe_metrics(void)
 {
+    ble_state_lock();
     clear_multi_probe_metrics();
     APP_LOGI(TAG, "BLE multiprobe counters reset");
+    ble_state_unlock();
 }
 
 esp_err_t ble_central_start_multi_report_probe(void)
 {
+    ble_state_lock();
     ble_central_reset_multi_probe_metrics();
     esp_err_t err = request_fast_conn_params_internal("multi_report_probe");
     APP_LOGI(TAG, "BLE multi-report probe started fd2_handle=0x%04x err=%s",
              (unsigned)s_input_val_handle,
              esp_err_to_name(err));
+    ble_state_unlock();
     return err;
 }
 
 esp_err_t ble_central_start_read_poll_probe(uint16_t rate_hz)
 {
-    if (!s_connected || s_state != BLE_STATE_CONNECTED || s_input_val_handle == 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
     if (rate_hz < BLE_READ_POLL_MIN_HZ || rate_hz > BLE_READ_POLL_MAX_HZ) {
         return ESP_ERR_INVALID_ARG;
     }
 
     ble_central_stop_read_poll_probe();
-    for (int i = 0; i < 50 && s_read_poll_task; i++) {
+    for (int i = 0; i < 50; i++) {
+        ble_state_lock();
+        bool running = s_read_poll_task != NULL;
+        ble_state_unlock();
+        if (!running) {
+            break;
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    if (s_read_poll_task) {
+
+    ble_state_lock();
+    if (s_read_poll_task || !s_connected || s_state != BLE_STATE_CONNECTED ||
+        !s_gatt_epoch.active || s_input_val_handle == 0) {
+        ble_state_unlock();
         return ESP_ERR_INVALID_STATE;
     }
+    read_poll_context_t *context = malloc(sizeof(*context));
+    if (!context) {
+        ble_state_unlock();
+        return ESP_ERR_NO_MEM;
+    }
+    *context = (read_poll_context_t) {
+        .rate_hz = rate_hz,
+        .conn_handle = s_conn_handle,
+        .generation = s_gatt_epoch.generation,
+    };
     clear_multi_probe_metrics();
     (void)request_fast_conn_params_internal("read_poll_probe");
     s_conn_metrics.read_poll_active = true;
@@ -2648,26 +2923,33 @@ esp_err_t ble_central_start_read_poll_probe(uint16_t rate_hz)
     BaseType_t created = xTaskCreate(read_poll_task,
                                      "ble_readpoll",
                                      4096,
-                                     (void *)(uintptr_t)rate_hz,
+                                     context,
                                      4,
                                      &s_read_poll_task);
     if (created != pdPASS) {
+        free(context);
         s_read_poll_task = NULL;
         s_conn_metrics.read_poll_active = false;
+        ble_state_unlock();
         return ESP_FAIL;
     }
+    ble_state_unlock();
     return ESP_OK;
 }
 
 void ble_central_stop_read_poll_probe(void)
 {
+    ble_state_lock();
     s_conn_metrics.read_poll_active = false;
     s_conn_metrics.read_poll_rate_hz = 0;
+    ble_state_unlock();
 }
 
 void ble_central_get_conn_metrics(ble_central_conn_metrics_t *out_metrics)
 {
+    ble_state_lock();
     if (!out_metrics) {
+        ble_state_unlock();
         return;
     }
     *out_metrics = s_conn_metrics;
@@ -2678,32 +2960,41 @@ void ble_central_get_conn_metrics(ble_central_conn_metrics_t *out_metrics)
     out_metrics->auto_scan_connect = s_auto_scan_connect;
     out_metrics->fast_param_block_remaining_ms =
         fast_param_block_remaining_ms(esp_timer_get_time());
+    ble_state_unlock();
 }
 
 void ble_central_set_imu_debug(bool enabled, uint32_t every)
 {
+    ble_state_lock();
     s_imu_debug_enabled = enabled;
     s_imu_debug_every = every == 0 ? 32 : every;
     s_imu_debug_seen = 0;
     APP_LOGI(TAG, "IMU debug %s every=%lu",
              enabled ? "enabled" : "disabled",
              (unsigned long)s_imu_debug_every);
+    ble_state_unlock();
 }
 
 bool ble_central_get_imu_debug(uint32_t *out_every)
 {
+    ble_state_lock();
     if (out_every) {
         *out_every = s_imu_debug_every;
     }
-    return s_imu_debug_enabled;
+    bool enabled = s_imu_debug_enabled;
+    ble_state_unlock();
+    return enabled;
 }
 
 esp_err_t ble_central_send_command(const uint8_t *data, uint16_t len)
 {
+    ble_state_lock();
     if (!data || len == 0) {
+        ble_state_unlock();
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_connected || s_cmd_val_handle == 0) {
+        ble_state_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2716,21 +3007,26 @@ esp_err_t ble_central_send_command(const uint8_t *data, uint16_t len)
                  (unsigned)len,
                  s_cmd_write_no_rsp ? "yes" : "no",
                  rc);
+        ble_state_unlock();
         return ESP_FAIL;
     }
     APP_LOGD(TAG, "BLE command write handle=0x%04x len=%u no_rsp=%s",
              s_cmd_val_handle,
              (unsigned)len,
              s_cmd_write_no_rsp ? "yes" : "no");
+    ble_state_unlock();
     return ESP_OK;
 }
 
 esp_err_t ble_central_send_rumble(const uint8_t *data, uint16_t len)
 {
+    ble_state_lock();
     if (!data || len == 0) {
+        ble_state_unlock();
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_connected || s_rumble_val_handle == 0) {
+        ble_state_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2743,27 +3039,35 @@ esp_err_t ble_central_send_rumble(const uint8_t *data, uint16_t len)
                  (unsigned)len,
                  s_rumble_write_no_rsp ? "yes" : "no",
                  rc);
+        ble_state_unlock();
         return ESP_FAIL;
     }
     APP_LOGD(TAG, "BLE rumble write handle=0x%04x len=%u no_rsp=%s",
              s_rumble_val_handle,
              (unsigned)len,
              s_rumble_write_no_rsp ? "yes" : "no");
+    ble_state_unlock();
     return ESP_OK;
 }
 
 const char *ble_central_state_string(void)
 {
+    ble_state_lock();
     switch (s_state) {
     case BLE_STATE_IDLE:
+        ble_state_unlock();
         return "idle";
     case BLE_STATE_SCANNING:
+        ble_state_unlock();
         return "scanning";
     case BLE_STATE_CONNECTING:
+        ble_state_unlock();
         return "connecting";
     case BLE_STATE_CONNECTED:
+        ble_state_unlock();
         return "connected";
     default:
+        ble_state_unlock();
         return "unknown";
     }
 }

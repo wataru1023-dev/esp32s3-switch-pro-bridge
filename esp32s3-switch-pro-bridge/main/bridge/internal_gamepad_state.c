@@ -21,7 +21,7 @@ void internal_gamepad_state_set_button(internal_gamepad_state_t *state,
                                        internal_gamepad_button_t button,
                                        bool pressed)
 {
-    if (!state || button >= INTERNAL_GAMEPAD_BUTTON_COUNT) {
+    if (!state || (unsigned)button >= INTERNAL_GAMEPAD_BUTTON_COUNT) {
         return;
     }
 
@@ -36,7 +36,7 @@ void internal_gamepad_state_set_button(internal_gamepad_state_t *state,
 bool internal_gamepad_state_get_button(const internal_gamepad_state_t *state,
                                        internal_gamepad_button_t button)
 {
-    if (!state || button >= INTERNAL_GAMEPAD_BUTTON_COUNT) {
+    if (!state || (unsigned)button >= INTERNAL_GAMEPAD_BUTTON_COUNT) {
         return false;
     }
     return (state->buttons & (1ULL << (uint8_t)button)) != 0;

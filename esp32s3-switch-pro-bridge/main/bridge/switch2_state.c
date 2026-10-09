@@ -26,6 +26,9 @@ void switch2_state_init(void)
 
 void switch2_state_reset(switch2_state_t *state)
 {
+    if (!state) {
+        return;
+    }
     memset(state, 0, sizeof(*state));
     state->lx = CENTER_12BIT;
     state->ly = CENTER_12BIT;
@@ -71,7 +74,7 @@ static void write_i16_le(uint8_t *dst, int16_t value)
 
 void switch2_state_set_button(switch2_state_t *state, switch2_button_t button, bool pressed)
 {
-    if (button >= SWITCH2_BUTTON_COUNT) {
+    if (!state || (unsigned)button >= SWITCH2_BUTTON_COUNT) {
         return;
     }
     uint32_t mask = 1u << button;
@@ -105,7 +108,7 @@ void switch2_state_set_motion_sample(switch2_state_t *state, const uint8_t *data
 
 bool switch2_state_get_button(const switch2_state_t *state, switch2_button_t button)
 {
-    if (button >= SWITCH2_BUTTON_COUNT) {
+    if (!state || (unsigned)button >= SWITCH2_BUTTON_COUNT) {
         return false;
     }
     return (state->buttons & (1u << button)) != 0;
@@ -222,6 +225,9 @@ void switch2_state_clear_live(void)
 
 void switch2_state_update_from_legacy_bytes(switch2_state_t *state, uint8_t b2, uint8_t b3, uint8_t b4)
 {
+    if (!state) {
+        return;
+    }
     reset_controls_preserving_motion(state);
     switch2_state_set_button(state, SWITCH2_BUTTON_B, (b2 & 0x01) != 0);
     switch2_state_set_button(state, SWITCH2_BUTTON_A, (b2 & 0x02) != 0);
@@ -248,6 +254,9 @@ void switch2_state_update_from_legacy_bytes(switch2_state_t *state, uint8_t b2, 
 
 void switch2_state_update_from_fd2_buttons(switch2_state_t *state, uint32_t buttons)
 {
+    if (!state) {
+        return;
+    }
     reset_controls_preserving_motion(state);
     switch2_state_set_button(state, SWITCH2_BUTTON_Y, (buttons & 0x00000001) != 0);
     switch2_state_set_button(state, SWITCH2_BUTTON_X, (buttons & 0x00000002) != 0);

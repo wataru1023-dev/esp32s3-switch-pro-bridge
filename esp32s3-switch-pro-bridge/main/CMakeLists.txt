@@ -4,6 +4,7 @@ idf_component_register(
         "usb/usb_descriptors.c"
         "usb/hid_report.c"
         "usb/usb_hid_device.c"
+        "usb/switch_legacy_protocol.c"
         "usb/usb_switch2_vendor.c"
         "ble/ble_central.c"
         "ble/switch2_gatt.c"
@@ -25,6 +26,7 @@ idf_component_register(
         "config"
     REQUIRES
         esp_tinyusb
+        esp_app_format
         bt
         nvs_flash
         esp_timer

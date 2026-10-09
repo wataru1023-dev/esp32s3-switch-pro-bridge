@@ -14,9 +14,12 @@
 #define SWITCH2_RUMBLE_CC48_UUID "cc483f51-9258-427d-a939-630c31f72b05"
 
 esp_err_t switch2_gatt_handle_notify(const char *uuid, const uint8_t *data, uint16_t len, switch2_state_t *out_state);
+esp_err_t switch2_gatt_parse_diagnostic(const char *uuid, const uint8_t *data, uint16_t len, switch2_state_t *out_state);
 esp_err_t switch2_gatt_send_rumble_stub(const uint8_t *data, uint16_t len);
 bool switch2_gatt_set_motion_source_offset(uint8_t offset);
 uint8_t switch2_gatt_get_motion_source_offset(void);
 void switch2_gatt_set_motion_full_only(bool enabled);
 bool switch2_gatt_get_motion_full_only(void);
 void switch2_gatt_reset_axis_calibration(void);
+void switch2_gatt_set_axis_debug(bool enabled, uint32_t every);
+bool switch2_gatt_get_axis_debug(uint32_t *out_every);
